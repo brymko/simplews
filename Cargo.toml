@@ -9,5 +9,5 @@ edition = "2018"
 anyhow = "^1"
 url = "^2"
 crossbeam = "^0.8"
-rustls = { path = "../rustls/rustls" }
+rustls = { path = "./rustls/rustls" }
 webpki-roots = "^0.22"
