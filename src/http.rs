@@ -38,6 +38,16 @@ impl StatusInformal {
             _ => None,
         }
     }
+
+    #[inline]
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Self::Continue => "100 Continue",
+            Self::SwitchingProtocols => "101 Switching Protocols",
+            Self::Processing => "102 Processing",
+            Self::EarlyHints => "103 Early Hints",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +104,22 @@ impl StatusSuccess {
             _ => None,
         }
     }
+
+    #[inline]
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Self::OK => "200 OK",
+            Self::Created => "201 Created",
+            Self::Accepted => "202 Accepted",
+            Self::NonAuthoritativeResponse => "203 Non-Authoritative Information",
+            Self::NoContent => "204 No Content",
+            Self::ResetContent => "205 Reset Content",
+            Self::PartialContent => "206 Partial Content",
+            Self::MutliStatus => "207 Multi-Status",
+            Self::AlreadyReported => "208 Already Reported",
+            Self::IMUsed => "226 IM Used",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -144,6 +170,21 @@ impl StatusRedirect {
             "307" | "307 Temporary Redirect" => Some(Self::TemporaryRedirect),
             "308" | "308 Permanent Redirect" => Some(Self::PermanentRedirect),
             _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Self::MultipleChoices => "300 Multiple Choices",
+            Self::MovedPermanently => "301 Moved Permanently",
+            Self::Found => "302 Found",
+            Self::SeeOther => "303 See Other",
+            Self::NotModified => "304 Not Modified",
+            Self::UseProxy => "305 Use Proxy",
+            Self::SwitchProxy => "306 Switch Proxy",
+            Self::TemporaryRedirect => "307 Temporary Redirect",
+            Self::PermanentRedirect => "308 Permanent Redirect",
         }
     }
 }
@@ -238,7 +279,7 @@ impl StatusClientError {
             "409" | "409 Conflict" => Some(Self::Conflict),
             "410" | "410 Gone" => Some(Self::Gone),
             "411" | "411 Length Required" => Some(Self::LengthRequired),
-            "412" | "412 Precondition Failed" => Some(Self::PreconditionRequired),
+            "412" | "412 Precondition Failed" => Some(Self::PreconditionFailed),
             "413" | "413 Payload Too Large" => Some(Self::PayloadTooLarge),
             "414" | "414 URI Too Long" => Some(Self::URITooLong),
             "415" | "415 Unsupported Media Type" => Some(Self::UnsupportedMediaType),
@@ -258,6 +299,41 @@ impl StatusClientError {
             }
             "451" | "451 Unavailable For Legal Reasons" => Some(Self::UnavailableForLegalReasons),
             _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Self::BadRequest => "400 Bad Request",
+            Self::Unauthorized => "401 Unauthorized",
+            Self::PaymentRequired => "402 Payment Required",
+            Self::Forbidden => "403 Forbidden",
+            Self::NotFound => "404 Not Found",
+            Self::MethodNotAllowed => "405 Method Not Allowed",
+            Self::NotAcceptable => "406 Not Acceptable",
+            Self::ProxyAuthenticationRequired => "407 Proxy Authentication Required",
+            Self::RequestTimeout => "408 Request Timeout",
+            Self::Conflict => "409 Conflict",
+            Self::Gone => "410 Gone",
+            Self::LengthRequired => "411 Length Required",
+            Self::PreconditionFailed => "412 Precondition Failed",
+            Self::PayloadTooLarge => "413 Payload Too Large",
+            Self::URITooLong => "414 URI Too Long",
+            Self::UnsupportedMediaType => "415 Unsupported Media Type",
+            Self::RangeNotSatisfiable => "416 Range Not Satisfiable",
+            Self::ExpectationFailed => "417 Expectation Failed",
+            Self::ImATeaPot => "418 I'm a teapot",
+            Self::MisdirectedRequest => "421 Misdirected Request",
+            Self::UnprocessabelEntity => "422 Unprocessable Entity",
+            Self::Locked => "423 Locked",
+            Self::FailedDependency => "424 Failed Dependency",
+            Self::TooEarly => "425 Too Early",
+            Self::UpgradeRequired => "426 Upgrade Required",
+            Self::PreconditionRequired => "428 Precondition Required",
+            Self::TooManyRequest => "429 Too Many Requests",
+            Self::RequestHeaderFieldsTooLarge => "431 Request Header Fields Too Large",
+            Self::UnavailableForLegalReasons => "451 Unavailable For Legal Reasons",
         }
     }
 }
@@ -318,6 +394,23 @@ impl StatusServerError {
                 Some(Self::NetworkAuthenticationRequired)
             }
             _ => None,
+        }
+    }
+
+    #[inline]
+    fn to_str(self) -> &'static str {
+        match self {
+            Self::InternalServerError => "500 Internal Server Error",
+            Self::NotImplemented => "501 Not Implemented",
+            Self::BadGateway => "502 Bad Gateway",
+            Self::ServiceUnavailable => "503 Service Unavailable",
+            Self::GatewayTimeout => "504 Gateway Timeout",
+            Self::HTTPVersionNotSupported => "505 HTTP Version Not Supported",
+            Self::VariantAlsoNegotiats => "506 Variant Also Negotiates",
+            Self::InsufficientStorage => "507 Insufficient Storage",
+            Self::LoopDetected => "508 Loop Detected",
+            Self::NotExtended => "510 Not Extended",
+            Self::NetworkAuthenticationRequired => "511 Network Authentication Required",
         }
     }
 }
@@ -396,6 +489,18 @@ impl HttpStatus {
                 .parse::<usize>()?,
         ));
     }
+
+    #[inline]
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Self::Informal(p) => p.to_str(),
+            Self::Success(p) => p.to_str(),
+            Self::Redirect(p) => p.to_str(),
+            Self::ClientError(p) => p.to_str(),
+            Self::ServerError(p) => p.to_str(),
+            Self::Unknown(_) => "",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -425,14 +530,18 @@ impl HttpVersion {
 }
 
 #[derive(Clone, Debug)]
-pub struct ParserResult {
+pub struct ResponseResult {
     pub headers: HashMap<String, String>,
     pub status: HttpStatus,
     pub version: HttpVersion,
 }
 
-pub fn parse(packet: Vec<u8>) -> Result<ParserResult> {
-    let raw = String::from_utf8(packet).context("Failed to parse packet as string")?;
+pub fn parse_response(packet: Vec<u8>) -> Result<ResponseResult> {
+    let raw = String::from_utf8_lossy(packet.as_slice());
+    let raw = raw
+        .split("\r\n\r\n")
+        .next()
+        .ok_or_else(|| anyhow!("Invalid http header: {:?}", packet))?;
 
     let mut lines = raw.split_terminator("\r\n");
 
@@ -456,9 +565,54 @@ pub fn parse(packet: Vec<u8>) -> Result<ParserResult> {
         }
     }
 
-    Ok(ParserResult {
+    Ok(ResponseResult {
         headers,
         status,
+        version,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestResult {
+    pub headers: HashMap<String, String>,
+    pub path: String,
+    pub version: HttpVersion,
+}
+
+pub fn parse_request(packet: Vec<u8>) -> Result<RequestResult> {
+    let raw = String::from_utf8_lossy(packet.as_slice());
+    let raw = raw
+        .split("\r\n\r\n")
+        .next()
+        .ok_or_else(|| anyhow!("Invalid http header: {:?}", packet))?;
+
+    let mut lines = raw.split_terminator("\r\n");
+
+    let meta = lines
+        .next()
+        .ok_or_else(|| anyhow!("Request Line missing: {:?}", raw))?;
+    let mut meta_split = meta.split_ascii_whitespace();
+    let method = meta_split
+        .next()
+        .ok_or_else(|| anyhow!("No method found"))?;
+    let path = meta_split.next().ok_or_else(|| anyhow!("No path found"))?;
+    let raw_version = meta_split.next().unwrap_or("");
+    let version = HttpVersion::from_str(raw_version)
+        .ok_or_else(|| anyhow!("Unknown version {:?}", raw_version))?;
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        let mut parts = line.splitn(2, ':');
+        if let (Some(header), Some(value)) = (parts.next(), parts.next()) {
+            headers.insert(header.to_lowercase(), value.trim_start().to_string());
+        } else {
+            break;
+        }
+    }
+
+    Ok(RequestResult {
+        headers,
+        path: path.to_string(),
         version,
     })
 }
@@ -493,7 +647,7 @@ impl HttpMethod {
 }
 
 #[derive(Clone, Debug)]
-pub struct Builder {
+pub struct ReqBuilder {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     url: Url,
@@ -501,7 +655,7 @@ pub struct Builder {
     method: Option<HttpMethod>,
 }
 
-impl Builder {
+impl ReqBuilder {
     pub fn new<S: AsRef<str>>(url: S) -> Result<Self> {
         Ok(Self {
             headers: Vec::new(),
@@ -574,6 +728,50 @@ impl Builder {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RespBuilder {
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    version: HttpVersion,
+    status: HttpStatus,
+}
+
+impl RespBuilder {
+    pub fn new(version: HttpVersion, status: HttpStatus) -> Self {
+        Self {
+            headers: Vec::new(),
+            body: Vec::new(),
+            version,
+            status,
+        }
+    }
+
+    pub fn header<S: ToString, D: ToString>(mut self, header: S, value: D) -> Self {
+        self.headers.push((header.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn body<B: AsRef<[u8]>>(mut self, body: B) -> Self {
+        self.body = body.as_ref().to_vec();
+        self
+    }
+
+    pub fn build(mut self) -> Vec<u8> {
+        let status_line = format!("{} {}\r\n", self.version.to_str(), self.status.to_str());
+        let mut headers = String::new();
+        for (header, value) in self.headers {
+            headers.push_str(format!("{}: {}\r\n", header, value).as_str());
+        }
+
+        let complete = format!("{}{}\r\n", status_line, headers);
+
+        let mut res = complete.as_bytes().to_vec();
+        res.append(self.body.as_mut());
+
+        res
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -588,7 +786,7 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r
 Sec-WebSocket-Protocol: chat\r
 \r\n";
 
-        let parsed = parse(http.as_ref().into()).unwrap();
+        let parsed = parse_response(http.as_ref().into()).unwrap();
         assert!(matches!(parsed.version, HttpVersion::Http11));
         assert!(matches!(parsed.status, HttpStatus::Informal(_)));
         assert!(parsed.status.to_int() == 101);
@@ -600,7 +798,7 @@ Sec-WebSocket-Protocol: chat\r
 
     #[test]
     fn http_build1() {
-        let builder = Builder::new("wss://server.example.com/chat")
+        let builder = ReqBuilder::new("wss://server.example.com/chat")
             .unwrap()
             .version(HttpVersion::Http11)
             .method(HttpMethod::GET)

@@ -2,12 +2,14 @@
 name = "simplews"
 version = "0.1.0"
 edition = "2018"
+test = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 anyhow = "^1"
 url = "^2"
-crossbeam = "^0.8"
+sha1 = "^0.6"
+base64 = "^0.13"
 rustls = { path = "./rustls/rustls" }
 webpki-roots = "^0.22"

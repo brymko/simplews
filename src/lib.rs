@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 mod dns;
 mod http;
@@ -130,45 +130,99 @@ enum ConnectionStatus {
 }
 
 #[derive(Debug)]
-pub struct Client {
+pub struct Writer {
     next_mask: u32,
-    current_fragment: Option<Frame>,
-    status: ConnectionStatus,
-    url: url::Url,
     io: TcpStream,
     ssl: Option<ssl::Stream>,
 }
 
-impl Clone for Client {
+impl Clone for Writer {
     fn clone(&self) -> Self {
         Self {
             next_mask: self.next_mask,
-            current_fragment: self.current_fragment.clone(),
-            status: self.status,
-            url: self.url.clone(),
             io: self.io.try_clone().unwrap(),
             ssl: self.ssl.clone(),
         }
     }
 }
 
-impl Client {
-    fn setup_sockets(&self) -> Result<()> {
-        self.io.set_nodelay(true)?;
-        self.io
-            .set_read_timeout(Some(std::time::Duration::from_secs(60)));
-        self.io
-            .set_write_timeout(Some(std::time::Duration::from_secs(60)));
+impl Writer {
+    fn raw_send<B: AsRef<[u8]>>(&mut self, bytes: B) -> Result<()> {
+        use std::io::Write;
+
+        if let Some(ssl) = &mut self.ssl {
+            ssl.write_all(bytes.as_ref())
+        } else {
+            self.io.write_all(bytes.as_ref())
+        }
+        .context("Failed to write bytes to stream")?;
+
         Ok(())
     }
 
+    pub fn send_message(&mut self, msg: Message) -> Result<()> {
+        let (opcode, payload) = match msg {
+            Message::Ping(p) => (WebsocketOpcode::Ping, p),
+            Message::Pong(p) => (WebsocketOpcode::Pong, p),
+            Message::Close(p) => (WebsocketOpcode::Close, p),
+            Message::Text(p) => (WebsocketOpcode::Text, p.as_bytes().to_vec()),
+            Message::Binary(p) => (WebsocketOpcode::Binary, p),
+        };
+
+        let mut mask_key = 0;
+        let mask = self.next_mask.to_be_bytes();
+        let payload = payload
+            .into_iter()
+            .map(|b| {
+                let encoded = b ^ mask[mask_key % 4];
+                mask_key += 1;
+                encoded
+            })
+            .collect::<Vec<_>>();
+
+        let frame = Frame {
+            fin: 1,
+            rsv1: 0,
+            rsv2: 0,
+            rsv3: 0,
+            opcode,
+            payload_len: payload.len() as u64,
+            payload,
+            mask_key: mask,
+            mask: 1,
+        };
+
+        self.next_mask += 1;
+
+        self.raw_send(frame.to_bytes())
+    }
+}
+fn setup_socket(sock: &TcpStream) -> Result<()> {
+    sock.set_nodelay(true)?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+    sock.set_write_timeout(Some(std::time::Duration::from_secs(60)));
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct Client {
+    current_fragment: Option<Frame>,
+    status: ConnectionStatus,
+    url: url::Url,
+    // next_mask: u32,
+    // io: TcpStream,
+    // ssl: Option<ssl::Stream>,
+    writer: Writer,
+}
+
+impl Client {
     fn do_handshake(&mut self) -> Result<()> {
-        if let Some(ssl) = &mut self.ssl {
+        if let Some(ssl) = &mut self.writer.ssl {
             ssl.do_handshake().context("Failed SSL handshake")?;
         }
 
         let random_token = "AQIDBAUGBwgJCgsMDQ4PEC==";
-        let open_handshake = http::Builder::from_url(self.url.clone())
+        let open_handshake = http::ReqBuilder::from_url(self.url.clone())
             .version(http::HttpVersion::Http11)
             .method(http::HttpMethod::GET)
             .header("Upgrade", "websocket")
@@ -177,12 +231,11 @@ impl Client {
             .header("Sec-WebSocket-Version", "13")
             .build();
 
-        // println!("{:?}", open_handshake);
         self.raw_send(open_handshake)
             .context("Failed to send opening handshake")?;
         let response = self.raw_recv().context("Failed to read opening response")?;
 
-        let response = http::parse(response).context("Failed to parse http response")?;
+        let response = http::parse_response(response).context("Failed to parse http response")?;
 
         match response.status {
             http::HttpStatus::Informal(http::StatusInformal::SwitchingProtocols) => {
@@ -227,16 +280,7 @@ impl Client {
     }
 
     fn raw_send<B: AsRef<[u8]>>(&mut self, bytes: B) -> Result<()> {
-        use std::io::Write;
-
-        if let Some(ssl) = &mut self.ssl {
-            ssl.write_all(bytes.as_ref())
-        } else {
-            self.io.write_all(bytes.as_ref())
-        }
-        .context("Failed to write bytes to stream")?;
-
-        Ok(())
+        self.writer.raw_send(bytes)
     }
 
     fn raw_recv_exact(&mut self, mut bytes: usize) -> Result<Vec<u8>> {
@@ -246,10 +290,10 @@ impl Client {
 
         loop {
             let mut buf = vec![0; bytes];
-            let amount = if let Some(ssl) = &mut self.ssl {
+            let amount = if let Some(ssl) = &mut self.writer.ssl {
                 ssl.read(&mut buf)
             } else {
-                self.io.read(&mut buf)
+                self.writer.io.read(&mut buf)
             }
             .context("Failed to read bytes from stream")?;
 
@@ -271,10 +315,10 @@ impl Client {
 
         loop {
             let mut buf = vec![0; CHUNK_SIZE];
-            let amount = if let Some(ssl) = &mut self.ssl {
+            let amount = if let Some(ssl) = &mut self.writer.ssl {
                 ssl.read(&mut buf)
             } else {
-                self.io.read(&mut buf)
+                self.writer.io.read(&mut buf)
             }
             .context("Failed to read bytes from stream")?;
 
@@ -298,7 +342,7 @@ impl Client {
         let rsv3 = (meta[0] >> 4) & 1;
         let opcode = meta[0] & 0xf;
         let mask = (meta[1] >> 7) & 1;
-        let payload_len = (meta[1] & 0xef) as u64;
+        let payload_len = (meta[1] & 0x7f) as u64;
 
         let payload_len = if payload_len == 126 {
             u16::from_be_bytes(self.raw_recv_exact(2)?.as_slice().try_into()?) as u64
@@ -379,51 +423,55 @@ impl Client {
         }
     }
 
+    fn from_socket(io: TcpStream, ssl: Option<ssl::Stream>) -> Self {
+        Self {
+            writer: Writer {
+                io,
+                ssl,
+                next_mask: 0,
+            },
+            url: url::Url::parse("ws://a.a").unwrap(),
+            current_fragment: None,
+            status: ConnectionStatus::Connecting,
+        }
+    }
+
+    pub fn create_writer(&self) -> Writer {
+        self.writer.clone()
+    }
+
     pub fn recv_message(&mut self) -> Result<Message> {
+        match self.status {
+            ConnectionStatus::Close | ConnectionStatus::Closing => {
+                bail!("WebSocket connection has been closed");
+            }
+            _ => {}
+        }
         let full_frame = self.next_full_fragment()?;
         match full_frame.opcode {
             WebsocketOpcode::Text => Ok(Message::Text(String::from_utf8(full_frame.payload)?)),
             WebsocketOpcode::Ping => Ok(Message::Ping(full_frame.payload)),
             WebsocketOpcode::Pong => Ok(Message::Pong(full_frame.payload)),
             WebsocketOpcode::Binary => Ok(Message::Binary(full_frame.payload)),
-            WebsocketOpcode::Close => Ok(Message::Close(full_frame.payload)),
+            WebsocketOpcode::Close => {
+                self.status = ConnectionStatus::Close;
+                Ok(Message::Close(full_frame.payload))
+            }
             _ => bail!("Opcode unhandled: {:?}", full_frame),
         }
     }
 
     pub fn send_message(&mut self, msg: Message) -> Result<()> {
-        let (opcode, payload) = match msg {
-            Message::Ping(p) => (WebsocketOpcode::Ping, p),
-            Message::Pong(p) => (WebsocketOpcode::Pong, p),
-            Message::Close(p) => (WebsocketOpcode::Close, p),
-            Message::Text(p) => (WebsocketOpcode::Text, p.as_bytes().to_vec()),
-            Message::Binary(p) => (WebsocketOpcode::Binary, p),
-        };
-
-        let mut mask_key = 0;
-        let mask = self.next_mask.to_be_bytes();
-        let payload = payload
-            .into_iter()
-            .map(|b| {
-                let encoded = b ^ mask[mask_key % 4];
-                mask_key += 1;
-                encoded
-            })
-            .collect::<Vec<_>>();
-
-        let frame = Frame {
-            fin: 1,
-            rsv1: 0,
-            rsv2: 0,
-            rsv3: 0,
-            opcode,
-            payload_len: payload.len() as u64,
-            payload,
-            mask_key: mask,
-            mask: 1,
-        };
-
-        self.raw_send(frame.to_bytes())
+        match self.status {
+            ConnectionStatus::Close | ConnectionStatus::Closing => {
+                bail!("WebSocket connection has been closed");
+            }
+            _ => {}
+        }
+        if let Message::Close(_) = &msg {
+            self.status = ConnectionStatus::Closing
+        }
+        self.writer.send_message(msg)
     }
 
     pub fn connect<Uri: AsRef<str>>(server_uri: Uri) -> Result<Self> {
@@ -446,15 +494,73 @@ impl Client {
 
         let mut this = Self {
             current_fragment: None,
-            next_mask: 0,
+            writer: Writer {
+                io,
+                ssl,
+                next_mask: 0,
+            },
             status: ConnectionStatus::Connecting,
-            io,
             url,
-            ssl,
         };
 
-        this.setup_sockets()?;
+        setup_socket(&this.writer.io);
         this.do_handshake()?;
+
+        Ok(this)
+    }
+}
+
+#[derive(Debug)]
+pub struct Server {
+    listener: TcpListener,
+    ssl: Option<ssl::Listener>,
+}
+
+impl Server {
+    fn do_handshake(client: &mut Client) -> Result<()> {
+        let client_handshake = client.raw_recv()?;
+        let req = http::parse_request(client_handshake)?;
+        let token = req
+            .headers
+            .get("sec-websocket-key")
+            .ok_or_else(|| anyhow!("Client didn't send us the challenge token"))?;
+
+        let mut to_sha = token.as_bytes().to_vec();
+        to_sha.extend_from_slice(b"58EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+
+        let sha = sha1::Sha1::from(to_sha).digest();
+        let encoded = base64::encode(sha.bytes());
+
+        let mut resp = http::RespBuilder::new(
+            http::HttpVersion::Http11,
+            http::HttpStatus::Informal(http::StatusInformal::SwitchingProtocols),
+        )
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Accept", encoded)
+        .build();
+
+        client.raw_send(resp)?;
+
+        client.status = ConnectionStatus::Open;
+
+        Ok(())
+    }
+
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self> {
+        Ok(Self {
+            listener: TcpListener::bind(addr)?,
+            ssl: None,
+        })
+    }
+
+    pub fn accept(&mut self) -> Result<Client> {
+        let (mut s, addr) = self.listener.accept()?;
+
+        setup_socket(&s);
+
+        let mut this = Client::from_socket(s, None);
+        Self::do_handshake(&mut this)?;
 
         Ok(this)
     }
@@ -463,6 +569,7 @@ impl Client {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::thread;
 
     #[test]
     fn it_works() {
@@ -628,40 +735,53 @@ mod test {
         assert!(frame.to_bytes() == wanted);
     }
 
-    // #[test]
-    // fn echo_test() {
-    //     let mut c = Client::connect("ws://echo.websocket.org").unwrap();
-    //     c.send_message(Message::Text("hello world".to_string()))
-    //         .unwrap();
-    //     let msg = c.recv_message().unwrap();
-    //     if let Message::Text(e) = msg {
-    //         assert!(e == *"hello world");
-    //     } else {
-    //         panic!("response not a text message");
-    //     }
-    // }
+    #[test]
+    fn echo_test() {
+        let mut c = Client::connect("ws://echo.websocket.org").unwrap();
+        c.send_message(Message::Text("hello world".to_string()))
+            .unwrap();
+        let msg = c.recv_message().unwrap();
+        if let Message::Text(e) = msg {
+            assert!(e == *"hello world");
+        } else {
+            panic!("response not a text message");
+        }
+    }
 
     #[test]
     fn alpaca_test() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::thread;
         let mut c = Client::connect("wss://stream.data.alpaca.markets/v2/iex").unwrap();
 
-        let finished = Arc::new(AtomicBool::new(false));
-        let tfin = finished.clone();
-        let mut tc = c.clone();
+        let mut tw = c.create_writer();
         thread::spawn(move || {
-            for _ in 0..6 {
-                let msg = tc.recv_message().unwrap();
-                println!("{:?}", msg);
+            for _ in 0..5 {
+                tw.send_message(Message::Ping(b"test".to_vec()));
             }
-            tfin.store(true, Ordering::SeqCst);
         });
-        for _ in 0..5 {
-            c.send_message(Message::Ping(b"loooool".to_vec()));
+        for _ in 0..6 {
+            // one extra for the init msg alpaca sends us
+            let msg = c.recv_message().unwrap();
+            // println!("{:?}", msg);
+            if let Message::Pong(c) = msg {
+                assert!(String::from_utf8(c).unwrap() == *"test");
+            }
         }
+    }
 
-        while !finished.load(Ordering::SeqCst) {}
+    #[test]
+    fn server_test() {
+        let addr = "ws://127.0.0.1:33456";
+        let bind_addr = "127.0.0.1:33456";
+        let mut s = Server::bind(bind_addr).unwrap();
+        thread::spawn(move || {
+            let mut c = Client::connect(addr).unwrap();
+            c.send_message(Message::Ping(b"loool".to_vec())).unwrap();
+        });
+        let mut c = s.accept().unwrap();
+        if let Message::Ping(s) = c.recv_message().unwrap() {
+            assert!(s == b"loool");
+        } else {
+            panic!("not ping received");
+        }
     }
 }

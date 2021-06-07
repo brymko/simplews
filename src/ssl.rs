@@ -84,6 +84,9 @@ impl std::io::Write for Stream {
     }
 }
 
+#[derive(Debug)]
+pub struct Listener {}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -104,8 +107,8 @@ mod test {
         let server_name = "www.google.com".try_into().unwrap();
         let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
         let mut sock = TcpStream::connect("www.google.com:443").unwrap();
-        let sock = TcpStreamClone { stream: sock };
-        let mut tls = rustls::StreamClonabel::new(conn, sock);
+        let mut sock = TcpStreamClone { stream: sock };
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
         let mut plaintext = Vec::new();
         let _ = tls
             .write(
@@ -119,7 +122,7 @@ mod test {
                 .as_bytes(),
             )
             .unwrap();
-        let ciphersuite = tls.conn.lock().unwrap().negotiated_cipher_suite().unwrap();
+        let ciphersuite = tls.conn.negotiated_cipher_suite().unwrap();
         tls.read_to_end(&mut plaintext).unwrap();
         let plain = String::from_utf8(plaintext[..100].to_vec()).unwrap();
         assert!(plain.contains("200 OK"));
@@ -151,20 +154,10 @@ mod test {
     fn manual_ws_echo_tls() {
         let mut s = TcpStream::connect("stream.data.alpaca.markets:443").unwrap();
         let mut s = Stream::new(s, "stream.data.alpaca.markets");
-        let _ = s.write(&[
-            71, 69, 84, 32, 47, 118, 50, 47, 105, 101, 120, 32, 72, 84, 84, 80, 47, 49, 46, 49, 13,
-            10, 72, 111, 115, 116, 58, 32, 101, 99, 104, 111, 46, 119, 101, 98, 115, 111, 99, 107,
-            101, 116, 46, 111, 114, 103, 13, 10, 85, 112, 103, 114, 97, 100, 101, 58, 32, 119, 101,
-            98, 115, 111, 99, 107, 101, 116, 13, 10, 67, 111, 110, 110, 101, 99, 116, 105, 111,
-            110, 58, 32, 85, 112, 103, 114, 97, 100, 101, 13, 10, 83, 101, 99, 45, 87, 101, 98, 83,
-            111, 99, 107, 101, 116, 45, 75, 101, 121, 58, 32, 65, 81, 73, 68, 66, 65, 85, 71, 66,
-            119, 103, 74, 67, 103, 115, 77, 68, 81, 52, 80, 69, 67, 61, 61, 13, 10, 83, 101, 99,
-            45, 87, 101, 98, 83, 111, 99, 107, 101, 116, 45, 86, 101, 114, 115, 105, 111, 110, 58,
-            32, 49, 51, 13, 10, 13, 10,
-        ]);
+        let _ = s.write(&[32, 49, 51, 13, 10, 13, 10]);
         let mut plaintext = Vec::new();
         s.read_to_end(&mut plaintext).unwrap();
         let plain = String::from_utf8(plaintext[..].to_vec()).unwrap();
-        println!("{:?}", plain);
+        assert!(plain.contains("Bad Request"))
     }
 }
