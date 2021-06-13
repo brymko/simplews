@@ -8,6 +8,7 @@ test = true
 
 [dependencies]
 anyhow = "^1"
+log = "^0.4"
 url = "^2"
 sha1 = "^0.6"
 base64 = "^0.13"

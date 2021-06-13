@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
 mod dns;
 mod http;
@@ -194,13 +194,22 @@ impl Writer {
 
         self.next_mask += 1;
 
+        log::trace!("sending frame: {:?}", frame);
+
         self.raw_send(frame.to_bytes())
+    }
+
+    pub fn remote(&self) -> String {
+        self.io
+            .peer_addr()
+            .map(|saddr| saddr.to_string())
+            .unwrap_or_else(|_| "Socket has no peer addr".to_string())
     }
 }
 fn setup_socket(sock: &TcpStream) -> Result<()> {
     sock.set_nodelay(true)?;
-    sock.set_read_timeout(Some(std::time::Duration::from_secs(60)));
-    sock.set_write_timeout(Some(std::time::Duration::from_secs(60)));
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(600)));
+    sock.set_write_timeout(Some(std::time::Duration::from_secs(600)));
     Ok(())
 }
 
@@ -209,9 +218,6 @@ pub struct Client {
     current_fragment: Option<Frame>,
     status: ConnectionStatus,
     url: url::Url,
-    // next_mask: u32,
-    // io: TcpStream,
-    // ssl: Option<ssl::Stream>,
     writer: Writer,
 }
 
@@ -423,14 +429,14 @@ impl Client {
         }
     }
 
-    fn from_socket(io: TcpStream, ssl: Option<ssl::Stream>) -> Self {
+    fn from_socket(io: TcpStream, addr: SocketAddr, ssl: Option<ssl::Stream>) -> Self {
         Self {
             writer: Writer {
                 io,
                 ssl,
                 next_mask: 0,
             },
-            url: url::Url::parse("ws://a.a").unwrap(),
+            url: url::Url::parse(addr.to_string().as_str()).unwrap(),
             current_fragment: None,
             status: ConnectionStatus::Connecting,
         }
@@ -443,11 +449,15 @@ impl Client {
     pub fn recv_message(&mut self) -> Result<Message> {
         match self.status {
             ConnectionStatus::Close | ConnectionStatus::Closing => {
+                self.writer.io.shutdown(std::net::Shutdown::Both);
                 bail!("WebSocket connection has been closed");
             }
             _ => {}
         }
+
         let full_frame = self.next_full_fragment()?;
+        log::trace!("received frame: {:?}", full_frame);
+
         match full_frame.opcode {
             WebsocketOpcode::Text => Ok(Message::Text(String::from_utf8(full_frame.payload)?)),
             WebsocketOpcode::Ping => Ok(Message::Ping(full_frame.payload)),
@@ -464,6 +474,7 @@ impl Client {
     pub fn send_message(&mut self, msg: Message) -> Result<()> {
         match self.status {
             ConnectionStatus::Close | ConnectionStatus::Closing => {
+                self.writer.io.shutdown(std::net::Shutdown::Both);
                 bail!("WebSocket connection has been closed");
             }
             _ => {}
@@ -507,6 +518,10 @@ impl Client {
         this.do_handshake()?;
 
         Ok(this)
+    }
+
+    pub fn name(&self) -> String {
+        self.writer.remote()
     }
 }
 
@@ -556,11 +571,14 @@ impl Server {
 
     pub fn accept(&mut self) -> Result<Client> {
         let (mut s, addr) = self.listener.accept()?;
+        log::info!("New connection request from {:?}", addr);
 
         setup_socket(&s);
 
-        let mut this = Client::from_socket(s, None);
+        let mut this = Client::from_socket(s, addr, None);
         Self::do_handshake(&mut this)?;
+
+        log::info!("New client {:?}", this.name());
 
         Ok(this)
     }
@@ -745,26 +763,6 @@ mod test {
             assert!(e == *"hello world");
         } else {
             panic!("response not a text message");
-        }
-    }
-
-    #[test]
-    fn alpaca_test() {
-        let mut c = Client::connect("wss://stream.data.alpaca.markets/v2/iex").unwrap();
-
-        let mut tw = c.create_writer();
-        thread::spawn(move || {
-            for _ in 0..5 {
-                tw.send_message(Message::Ping(b"test".to_vec()));
-            }
-        });
-        for _ in 0..6 {
-            // one extra for the init msg alpaca sends us
-            let msg = c.recv_message().unwrap();
-            // println!("{:?}", msg);
-            if let Message::Pong(c) = msg {
-                assert!(String::from_utf8(c).unwrap() == *"test");
-            }
         }
     }
 
