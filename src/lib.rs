@@ -4,6 +4,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 mod dns;
 mod http;
@@ -131,6 +133,9 @@ enum ConnectionStatus {
 
 #[derive(Debug)]
 pub struct Writer {
+    is_socket_active: Arc<AtomicBool>,
+    peer_name: String,
+    should_mask: bool,
     next_mask: u32,
     io: TcpStream,
     ssl: Option<ssl::Stream>,
@@ -139,7 +144,10 @@ pub struct Writer {
 impl Clone for Writer {
     fn clone(&self) -> Self {
         Self {
+            is_socket_active: self.is_socket_active.clone(),
             next_mask: self.next_mask,
+            should_mask: self.should_mask,
+            peer_name: self.peer_name.clone(),
             io: self.io.try_clone().unwrap(),
             ssl: self.ssl.clone(),
         }
@@ -149,18 +157,32 @@ impl Clone for Writer {
 impl Writer {
     fn raw_send<B: AsRef<[u8]>>(&mut self, bytes: B) -> Result<()> {
         use std::io::Write;
+        use std::sync::atomic::Ordering;
 
-        if let Some(ssl) = &mut self.ssl {
+        if !self.is_socket_active.load(Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+        }
+
+        let res = if let Some(ssl) = &mut self.ssl {
             ssl.write_all(bytes.as_ref())
         } else {
             self.io.write_all(bytes.as_ref())
         }
-        .context("Failed to write bytes to stream")?;
+        .context("Failed to write bytes to stream");
+
+        if res.is_err() {
+            log::trace!("Stream send error: {:?}", res);
+            self.is_socket_active.store(false, Ordering::SeqCst);
+        }
+
+        res?;
 
         Ok(())
     }
 
     pub fn send_message(&mut self, msg: Message) -> Result<()> {
+        log::trace!("trying to send to {:?} message: {:?}", self.name(), msg);
+
         let (opcode, payload) = match msg {
             Message::Ping(p) => (WebsocketOpcode::Ping, p),
             Message::Pong(p) => (WebsocketOpcode::Pong, p),
@@ -171,14 +193,18 @@ impl Writer {
 
         let mut mask_key = 0;
         let mask = self.next_mask.to_be_bytes();
-        let payload = payload
-            .into_iter()
-            .map(|b| {
-                let encoded = b ^ mask[mask_key % 4];
-                mask_key += 1;
-                encoded
-            })
-            .collect::<Vec<_>>();
+        let payload = if self.should_mask {
+            payload
+                .into_iter()
+                .map(|b| {
+                    let encoded = b ^ mask[mask_key % 4];
+                    mask_key += 1;
+                    encoded
+                })
+                .collect::<Vec<_>>()
+        } else {
+            payload
+        };
 
         let frame = Frame {
             fin: 1,
@@ -189,23 +215,19 @@ impl Writer {
             payload_len: payload.len() as u64,
             payload,
             mask_key: mask,
-            mask: 1,
+            mask: if self.should_mask { 1 } else { 0 },
         };
 
-        self.next_mask += 1;
-
-        log::trace!("sending frame: {:?}", frame);
+        self.next_mask.wrapping_add(1);
 
         self.raw_send(frame.to_bytes())
     }
 
-    pub fn remote(&self) -> String {
-        self.io
-            .peer_addr()
-            .map(|saddr| saddr.to_string())
-            .unwrap_or_else(|_| "Socket has no peer addr".to_string())
+    pub fn name(&self) -> &str {
+        self.peer_name.as_str()
     }
 }
+
 fn setup_socket(sock: &TcpStream) -> Result<()> {
     sock.set_nodelay(true)?;
     sock.set_read_timeout(Some(std::time::Duration::from_secs(600)));
@@ -289,27 +311,58 @@ impl Client {
         self.writer.raw_send(bytes)
     }
 
-    fn raw_recv_exact(&mut self, mut bytes: usize) -> Result<Vec<u8>> {
-        use std::io::Read;
+    fn recv_some(&mut self, size: usize) -> Result<Vec<u8>> {
+        assert!(size != 0);
 
+        use std::sync::atomic::Ordering;
+
+        if !self.writer.is_socket_active.load(Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+        }
+
+        let mut ret = vec![0; size];
+        let amount = match if let Some(ssl) = &mut self.writer.ssl {
+            ssl.read(&mut ret)
+        } else {
+            self.writer.io.read(&mut ret)
+        }
+        .context("Failed to read bytes from stream")
+        {
+            Err(e) => {
+                log::trace!("Stream recv error: {:?}", e);
+                self.writer.is_socket_active.store(false, Ordering::SeqCst);
+                self.writer.io.shutdown(std::net::Shutdown::Both);
+                return Err(e);
+            }
+            // In this case we have to be reaaaaally careful to not make a call to this function
+            // with size == 0, see assert at the beginning. if the returend value is 0 this
+            // indicates an unexpected eof
+            Ok(o) if o == 0 => {
+                log::trace!("Stream unexpected EOF {:?}", self.name());
+                self.writer.is_socket_active.store(false, Ordering::SeqCst);
+                self.writer.io.shutdown(std::net::Shutdown::Both);
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+            }
+            Ok(o) => o,
+        };
+
+        ret.truncate(amount);
+
+        Ok(ret)
+    }
+
+    fn raw_recv_exact(&mut self, mut bytes: usize) -> Result<Vec<u8>> {
         let mut ret = Vec::with_capacity(bytes);
 
         loop {
-            let mut buf = vec![0; bytes];
-            let amount = if let Some(ssl) = &mut self.writer.ssl {
-                ssl.read(&mut buf)
-            } else {
-                self.writer.io.read(&mut buf)
-            }
-            .context("Failed to read bytes from stream")?;
+            let buf = self.recv_some(bytes)?;
+            ret.extend_from_slice(&buf);
 
-            ret.extend_from_slice(&buf[..amount]);
-
-            if amount >= bytes {
+            if ret.len() >= bytes {
                 break;
             }
 
-            bytes -= amount;
+            bytes -= buf.len();
         }
 
         Ok(ret)
@@ -320,17 +373,10 @@ impl Client {
         let mut ret = Vec::with_capacity(CHUNK_SIZE);
 
         loop {
-            let mut buf = vec![0; CHUNK_SIZE];
-            let amount = if let Some(ssl) = &mut self.writer.ssl {
-                ssl.read(&mut buf)
-            } else {
-                self.writer.io.read(&mut buf)
-            }
-            .context("Failed to read bytes from stream")?;
+            let buf = self.recv_some(CHUNK_SIZE)?;
+            ret.extend_from_slice(&buf);
 
-            ret.extend_from_slice(&buf[..amount]);
-
-            if amount != CHUNK_SIZE {
+            if buf.len() != CHUNK_SIZE {
                 break;
             }
         }
@@ -430,13 +476,19 @@ impl Client {
     }
 
     fn from_socket(io: TcpStream, addr: SocketAddr, ssl: Option<ssl::Stream>) -> Self {
+        let url_string = format!("wss://{:?}", addr);
         Self {
             writer: Writer {
+                peer_name: addr.to_string(),
+                is_socket_active: Arc::new(AtomicBool::new(true)),
                 io,
                 ssl,
+                should_mask: false,
                 next_mask: 0,
             },
-            url: url::Url::parse(addr.to_string().as_str()).unwrap(),
+            url: url::Url::parse(url_string.as_str()).unwrap_or_else(|_| {
+                url::Url::parse("wss://dummy.url.this.should.not.happen/").unwrap()
+            }),
             current_fragment: None,
             status: ConnectionStatus::Connecting,
         }
@@ -447,8 +499,12 @@ impl Client {
     }
 
     pub fn recv_message(&mut self) -> Result<Message> {
+        use std::sync::atomic::Ordering;
+
         match self.status {
             ConnectionStatus::Close | ConnectionStatus::Closing => {
+                log::trace!("WebSocket Connection has been closed");
+                self.writer.is_socket_active.store(false, Ordering::SeqCst);
                 self.writer.io.shutdown(std::net::Shutdown::Both);
                 bail!("WebSocket connection has been closed");
             }
@@ -456,9 +512,8 @@ impl Client {
         }
 
         let full_frame = self.next_full_fragment()?;
-        log::trace!("received frame: {:?}", full_frame);
 
-        match full_frame.opcode {
+        let msg = match full_frame.opcode {
             WebsocketOpcode::Text => Ok(Message::Text(String::from_utf8(full_frame.payload)?)),
             WebsocketOpcode::Ping => Ok(Message::Ping(full_frame.payload)),
             WebsocketOpcode::Pong => Ok(Message::Pong(full_frame.payload)),
@@ -468,12 +523,17 @@ impl Client {
                 Ok(Message::Close(full_frame.payload))
             }
             _ => bail!("Opcode unhandled: {:?}", full_frame),
-        }
+        };
+
+        log::trace!("received from {:?} message: {:?}", self.name(), msg);
+
+        msg
     }
 
     pub fn send_message(&mut self, msg: Message) -> Result<()> {
         match self.status {
             ConnectionStatus::Close | ConnectionStatus::Closing => {
+                log::trace!("WS Connection has been closed");
                 self.writer.io.shutdown(std::net::Shutdown::Both);
                 bail!("WebSocket connection has been closed");
             }
@@ -506,9 +566,12 @@ impl Client {
         let mut this = Self {
             current_fragment: None,
             writer: Writer {
+                peer_name: host.to_string(),
+                should_mask: true,
+                is_socket_active: Arc::new(AtomicBool::new(true)),
                 io,
                 ssl,
-                next_mask: 0,
+                next_mask: 1,
             },
             status: ConnectionStatus::Connecting,
             url,
@@ -520,8 +583,8 @@ impl Client {
         Ok(this)
     }
 
-    pub fn name(&self) -> String {
-        self.writer.remote()
+    pub fn name(&self) -> &str {
+        self.writer.name()
     }
 }
 
@@ -533,15 +596,16 @@ pub struct Server {
 
 impl Server {
     fn do_handshake(client: &mut Client) -> Result<()> {
-        let client_handshake = client.raw_recv()?;
-        let req = http::parse_request(client_handshake)?;
+        let client_handshake = client.raw_recv().context("Failed to received handshake")?;
+        let req =
+            http::parse_request(client_handshake).context("Failed to parse handshake request")?;
         let token = req
             .headers
             .get("sec-websocket-key")
             .ok_or_else(|| anyhow!("Client didn't send us the challenge token"))?;
 
         let mut to_sha = token.as_bytes().to_vec();
-        to_sha.extend_from_slice(b"58EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        to_sha.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 
         let sha = sha1::Sha1::from(to_sha).digest();
         let encoded = base64::encode(sha.bytes());
@@ -555,7 +619,9 @@ impl Server {
         .header("Sec-WebSocket-Accept", encoded)
         .build();
 
-        client.raw_send(resp)?;
+        client
+            .raw_send(resp)
+            .context("Failed to send handshake response")?;
 
         client.status = ConnectionStatus::Open;
 
