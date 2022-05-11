@@ -7,7 +7,6 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-mod dns;
 mod http;
 mod ssl;
 
